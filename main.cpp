@@ -16,6 +16,7 @@
 #include <linux/rtnetlink.h>
 #include <unistd.h>
 #include <netinet/ip.h>
+#include <memory>
 
 constexpr size_t BUF_SIZE = 4ull * 1024ull * 1024ull;
 
@@ -135,10 +136,23 @@ public:
     mutable connection_state state = connection_state::WAITING_ADDRESS;
     mutable in_addr addr;
 private:
-
     mutable size_t cnt = 0;
-    mutable unsigned size;
+    mutable unsigned size = 0;
     mutable char data[BUF_SIZE];
+    mutable unsigned char sendBuf[BUF_SIZE];
+
+    static size_t writeVarUInt(unsigned num, unsigned char* buf) {
+        int len = 0;
+        do {
+            unsigned char tmp = num & 0b1111111u;
+            num >>= 7u;
+            if (num) tmp |= 0b10000000u;
+            *buf = tmp;
+            ++buf;
+            ++len;
+        } while (num);
+        return len;
+    }
 
     int setRoute(bool flag) const {
         fd_guard nlSocket = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE);
@@ -229,17 +243,22 @@ public:
 
     int send(const char* buf, size_t len, bool withLen = true) const {
         if (withLen) {
-            unsigned uLen = len;
-            auto bytesWritten = write(fd, &uLen, sizeof(uLen));
+            unsigned char* ptr = sendBuf;
+            size_t lenLen = writeVarUInt(len, ptr);
+            if (lenLen + len > BUF_SIZE) return -1;
+            ptr += lenLen;
+            memcpy(ptr, buf, len);
+            auto bytesWritten = write(fd, sendBuf, lenLen + len);
             if (bytesWritten < 0) {
                 printf("[tcp_connection %d] write failed with %d\n", operator int(), errno);
-                return -1;
+                return -2;
             }
-        }
-        auto bytesWritten = write(fd, buf, len);
-        if (bytesWritten < 0) {
-            printf("[tcp_connection %d] write failed with %d\n", operator int(), errno);
-            return -2;
+        } else {
+            auto bytesWritten = write(fd, buf, len);
+            if (bytesWritten < 0) {
+                printf("[tcp_connection %d] write failed with %d\n", operator int(), errno);
+                return -3;
+            }
         }
         return 0;
     }
@@ -277,17 +296,24 @@ public:
                         printf("[tcp_connection %d] Route added\n", operator int());
                         state = connection_state::WAITING_LENGTH;
                         cnt = 0;
+                        size = 0;
                     }
                     break;
                 }
                 case connection_state::WAITING_LENGTH: {
-                    size_t sizeLeft = sizeof(size) - cnt;
-                    size_t sizeRead = std::min(len, sizeLeft);
-                    memcpy(reinterpret_cast<char *>(&size) + cnt, buf, sizeRead);
-                    cnt += sizeRead;
-                    buf += sizeRead;
-                    len -= sizeRead;
-                    if (cnt == sizeof(size)) {
+                    bool flag = false;
+                    while (len) {
+                        size <<= 7u;
+                        unsigned char tmp = *buf;
+                        size |= tmp & 0b1111111u;
+                        ++buf;
+                        --len;
+                        if (!(tmp & 0b10000000u)) {
+                            flag = true;
+                            break;
+                        }
+                    }
+                    if (flag) {
                         if (size > BUF_SIZE) {
                             printf("[tcp_connection %d] Illegal data size: %u\n", operator int(), size);
                             return -2;
@@ -312,6 +338,7 @@ public:
                         }
                         state = connection_state::WAITING_LENGTH;
                         cnt = 0;
+                        size = 0;
                     }
                     break;
                 }
@@ -437,7 +464,8 @@ int server_loop(const tun_device& tun, int port) {
 }
 
 int client_loop(const tun_device& tun, in_addr serverAddr, int port) {
-    tcp_connection conn{ tun };
+    std::unique_ptr<tcp_connection> connPtr = std::make_unique<tcp_connection>(tun);
+    tcp_connection& conn = *connPtr;
     if (conn.init() < 0) return -1;
     if (conn.enableKeepAlive() < 0) return -2;
     if (conn.connect(serverAddr, port) < 0) return -3;
