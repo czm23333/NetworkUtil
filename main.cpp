@@ -19,9 +19,10 @@
 constexpr size_t BUF_SIZE = 4ull * 1024ull * 1024ull;
 
 class fd_guard {
-private:
-    int fd;
 public:
+    int fd;
+
+    fd_guard() : fd(-1) {}
     fd_guard(int fd) : fd(fd) {}
     fd_guard(const fd_guard&) = delete;
     fd_guard(fd_guard&& other) noexcept {
@@ -32,8 +33,93 @@ public:
         if (fd >= 0) close(fd);
     }
 
+    fd_guard& operator=(fd_guard&& other) noexcept {
+        if (fd >= 0) close(fd);
+        fd = other.fd;
+        other.fd = -1;
+        return *this;
+    }
+
     operator int() const {
         return fd;
+    }
+};
+
+class tun_device {
+public:
+    char devName[1025] = "tun%d";
+    fd_guard fd;
+    unsigned index = 0;
+    in_addr address;
+
+    tun_device() = default;
+
+    int init() {
+        fd_guard tmp = open("/dev/net/tun", O_RDWR);
+        if(tmp < 0) return -1;
+
+        ifreq ifr;
+        memset(&ifr, 0, sizeof(ifr));
+        ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+        strncpy(ifr.ifr_name, devName, IFNAMSIZ);
+
+        if(ioctl(tmp, TUNSETIFF, &ifr) < 0) return -2;
+        strcpy(devName, ifr.ifr_name);
+
+        index = if_nametoindex(devName);
+
+        fd = std::move(tmp);
+        return 0;
+    }
+
+    int enable(const in_addr& ip) {
+        fd_guard sockFD = socket(AF_INET, SOCK_DGRAM, 0);
+        if(sockFD < 0) return -1;
+
+        ifreq ifr;
+        memset(&ifr, 0, sizeof(ifr));
+        strncpy(ifr.ifr_name, devName, IFNAMSIZ);
+        if (ioctl(sockFD, SIOCGIFFLAGS, &ifr) < 0) return -2;
+
+        if (!(ifr.ifr_flags & IFF_UP)) {
+            ifr.ifr_flags |= IFF_UP;
+            if (ioctl(sockFD, SIOCSIFFLAGS, &ifr) < 0) return -3;
+        }
+
+        sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr = ip;
+        memcpy(&ifr.ifr_addr, &addr, sizeof(addr));
+
+        if (ioctl(sockFD, SIOCSIFADDR, &ifr) < 0) return -4;
+
+        inet_aton("255.255.255.255", &addr.sin_addr);
+        memcpy(&ifr.ifr_netmask, &addr, sizeof(addr));
+        if (ioctl(sockFD, SIOCSIFNETMASK, &ifr) < 0) return -5;
+
+        address = ip;
+
+        return 0;
+    }
+
+    int send(const char* buf, size_t len) const {
+        auto bytesWritten = write(fd, buf, len);
+        if (bytesWritten < 0) {
+            printf("[tun_device] write failed with %d\n", errno);
+            return -1;
+        }
+        return 0;
+    }
+
+    template<size_t S>
+    long recv(char (&buf)[S]) const {
+        auto bytesRead = read(fd, buf, sizeof(buf));
+        if (bytesRead < 0) {
+            printf("[tun_device] read failed with %d\n", errno);
+            return -1;
+        }
+        return bytesRead;
     }
 };
 
@@ -41,11 +127,10 @@ enum class connection_state {
     WAITING_ADDRESS, WAITING_LENGTH, WAITING_CONTENT
 };
 
-class connection {
+class tcp_connection {
 public:
-    const fd_guard fd;
-    const unsigned tunIndex;
-    const in_addr selfAddr;
+    fd_guard fd;
+    const tun_device& tun;
 private:
     mutable connection_state state = connection_state::WAITING_ADDRESS;
 
@@ -84,35 +169,32 @@ private:
 
         attr = RTA_NEXT(attr, bufAvail);
         attr->rta_type = RTA_PREFSRC;
-        attr->rta_len = RTA_LENGTH(sizeof(selfAddr));
+        attr->rta_len = RTA_LENGTH(sizeof(tun.address));
         req.nh.nlmsg_len += attr->rta_len;
-        memcpy(RTA_DATA(attr), &selfAddr, sizeof(selfAddr));
+        memcpy(RTA_DATA(attr), &tun.address, sizeof(tun.address));
 
         attr = RTA_NEXT(attr, bufAvail);
         attr->rta_type = RTA_OIF;
-        attr->rta_len = RTA_LENGTH(sizeof(tunIndex));
+        attr->rta_len = RTA_LENGTH(sizeof(tun.index));
         req.nh.nlmsg_len += attr->rta_len;
-        memcpy(RTA_DATA(attr), &tunIndex, sizeof(tunIndex));
+        memcpy(RTA_DATA(attr), &tun.index, sizeof(tun.index));
 
         if (write(nlSocket, &req, req.nh.nlmsg_len) < 0) return -2;
 
         return 0;
     }
 public:
-    explicit connection(int fd, unsigned tunIndex, const in_addr& selfAddr) : fd(fd), tunIndex(tunIndex), selfAddr(selfAddr) {
-        memset(&addr, 0, sizeof(addr));
-    }
-    explicit connection(fd_guard&& fd, unsigned tunIndex, const in_addr& selfAddr) : fd(std::move(fd)), tunIndex(tunIndex), selfAddr(selfAddr) {
-        memset(&addr, 0, sizeof(addr));
-    }
-    connection(const connection&) = delete;
-    connection(connection&& other) = delete;
+    explicit tcp_connection(const tun_device& tun) : tun(tun) {}
+    tcp_connection(int fd, const tun_device& tun) : fd(fd), tun(tun) {}
+    tcp_connection(fd_guard&& fd, const tun_device& tun) : fd{ std::move(fd) }, tun(tun) {}
+    tcp_connection(const tcp_connection&) = delete;
+    tcp_connection(tcp_connection&& other) = delete;
 
-    ~connection() {
+    ~tcp_connection() {
         if (state != connection_state::WAITING_ADDRESS) {
             int res = setRoute(false);
-            if (res < 0) printf("[connection %d] setRoute (del) failed with %d\n", operator int(), res);
-            printf("[connection %d] Route deleted\n", operator int());
+            if (res < 0) printf("[tcp_connection %d] setRoute (del) failed with %d\n", operator int(), res);
+            else printf("[tcp_connection %d] Route deleted\n", operator int());
         }
     }
 
@@ -120,25 +202,58 @@ public:
         return fd;
     }
 
+    int init() {
+        int tmp = socket(AF_INET, SOCK_STREAM, 0);
+        if (tmp < 0) return -1;
+        fd = tmp;
+        return 0;
+    }
+
+    int enableKeepAlive() const {
+        static const int keepAlive = 1;
+        if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepAlive, sizeof(keepAlive)) < 0) return -1;
+        return 0;
+    }
+
+    int connect(const in_addr& serverAddr, int port) const {
+        sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr = serverAddr;
+        addr.sin_port = htons(port);
+        if (::connect(fd, reinterpret_cast<const struct sockaddr *>(&addr), sizeof(addr)) < 0) return -1;
+        return 0;
+    }
+
     int send(const char* buf, size_t len, bool withLen = true) const {
         if (withLen) {
             unsigned uLen = len;
             auto bytesWritten = write(fd, &uLen, sizeof(uLen));
             if (bytesWritten < 0) {
-                printf("[connection %d] write failed with %d\n", operator int(), errno);
+                printf("[tcp_connection %d] write failed with %d\n", operator int(), errno);
                 return -1;
             }
         }
         auto bytesWritten = write(fd, buf, len);
         if (bytesWritten < 0) {
-            printf("[connection %d] write failed with %d\n", operator int(), errno);
+            printf("[tcp_connection %d] write failed with %d\n", operator int(), errno);
             return -2;
         }
         return 0;
     }
 
-    int init() const {
-        return send(reinterpret_cast<const char *>(&selfAddr), sizeof(selfAddr), false);
+    int sendHandshake() const {
+        return send(reinterpret_cast<const char *>(&tun.address), sizeof(tun.address), false);
+    }
+
+    template<size_t S>
+    long recv(char (&buf)[S]) const {
+        auto bytesRead = read(fd, buf, sizeof(buf));
+        if (bytesRead < 0) {
+            printf("[tcp_connection %d] read failed with %d\n", fd.operator int(), errno);
+            return -1;
+        }
+        return bytesRead;
     }
 
     int onRecv(const char* buf, size_t len, const fd_guard& tunFD) const {
@@ -154,10 +269,10 @@ public:
                     if (cnt == sizeof(addr)) {
                         int res = setRoute(true);
                         if (res < 0) {
-                            printf("[connection %d] setRoute (add) failed with %d\n", operator int(), res);
+                            printf("[tcp_connection %d] setRoute (add) failed with %d\n", operator int(), res);
                             return -1;
                         }
-                        printf("[connection %d] Route added\n", operator int());
+                        printf("[tcp_connection %d] Route added\n", operator int());
                         state = connection_state::WAITING_LENGTH;
                         cnt = 0;
                     }
@@ -172,7 +287,7 @@ public:
                     len -= sizeRead;
                     if (cnt == sizeof(size)) {
                         if (size > BUF_SIZE) {
-                            printf("[connection %d] Illegal data size: %u\n", operator int(), size);
+                            printf("[tcp_connection %d] Illegal data size: %u\n", operator int(), size);
                             return -2;
                         }
                         state = connection_state::WAITING_CONTENT;
@@ -188,9 +303,9 @@ public:
                     buf += dataRead;
                     len -= dataRead;
                     if (cnt == size) {
-                        auto bytesWritten = write(tunFD, data, size);
-                        if (bytesWritten < 0) {
-                            printf("[connection %d] write to TUN device failed with %d\n", operator int(), errno);
+                        auto res = tun.send(data, size);
+                        if (res < 0) {
+                            printf("[tcp_connection %d] write to TUN device failed with %d\n", operator int(), res);
                             return -3;
                         }
                         state = connection_state::WAITING_LENGTH;
@@ -206,54 +321,7 @@ public:
 
 char buffer[BUF_SIZE];
 
-fd_guard tun_alloc(char *dev) {
-    ifreq ifr;
-    int fd, err;
-
-    if((fd = open("/dev/net/tun", O_RDWR)) < 0)
-        return -1;
-
-    memset(&ifr, 0, sizeof(ifr));
-    ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
-
-    if((err = ioctl(fd, TUNSETIFF, &ifr)) < 0){
-        close(fd);
-        return err;
-    }
-    strcpy(dev, ifr.ifr_name);
-    return { fd };
-}
-
-int assign_address(const char* name, const in_addr& ip) {
-    fd_guard sockFD = socket(AF_INET, SOCK_DGRAM, 0);
-    if(sockFD < 0) return -1;
-
-    ifreq ifr;
-    memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, name, IFNAMSIZ);
-    if (ioctl(sockFD, SIOCGIFFLAGS, &ifr) < 0) return -2;
-
-    if (!(ifr.ifr_flags & IFF_UP)) {
-        ifr.ifr_flags |= IFF_UP;
-        if (ioctl(sockFD, SIOCSIFFLAGS, &ifr) < 0) return -3;
-    }
-
-    sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr = ip;
-    memcpy(&ifr.ifr_addr, &addr, sizeof(addr));
-
-    if (ioctl(sockFD, SIOCSIFADDR, &ifr) < 0) return -4;
-
-    inet_aton("255.255.255.255", &addr.sin_addr);
-    memcpy(&ifr.ifr_netmask, &addr, sizeof(addr));
-    if (ioctl(sockFD, SIOCSIFNETMASK, &ifr) < 0) return -5;
-
-    return 0;
-}
-
-int server_loop(const fd_guard& tunFD, unsigned tunIndex, in_addr selfAddr, int port) {
+int server_loop(const tun_device& tun, int port) {
     fd_guard listenSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (listenSocket < 0) return -1;
     sockaddr_in serverAddr;
@@ -275,13 +343,13 @@ int server_loop(const fd_guard& tunFD, unsigned tunIndex, in_addr selfAddr, int 
     event.data.fd = listenSocket;
     if (epoll_ctl(epollFD, EPOLL_CTL_ADD, listenSocket, &event) < 0) return -6;
     event.events = EPOLLIN;
-    event.data.fd = tunFD;
-    if (epoll_ctl(epollFD, EPOLL_CTL_ADD, tunFD, &event) < 0) return -7;
+    event.data.fd = tun.fd;
+    if (epoll_ctl(epollFD, EPOLL_CTL_ADD, tun.fd, &event) < 0) return -7;
     epoll_event events[4096];
 
     printf("[server] Epoll initialized\n");
 
-    std::set<connection, std::less<void>> clients;
+    std::set<tcp_connection, std::less<void>> clients;
     while (true) {
         int num = epoll_wait(epollFD, events, 4096, -1);
         if (num < 0) {
@@ -296,56 +364,57 @@ int server_loop(const fd_guard& tunFD, unsigned tunIndex, in_addr selfAddr, int 
                     printf("[server] accept failed with %d\n", errno);
                     continue;
                 }
-                if (setsockopt(connectionSocket, SOL_SOCKET, SO_KEEPALIVE, &keepAlive, sizeof(keepAlive)) < 0) {
-                    printf("[connection %d] setsockopt failed with %d\n", connectionSocket, errno);
+                auto [iter, success] = clients.emplace(connectionSocket, tun);
+                if (!success) {
+                    printf("[server] emplace failed\n");
                     close(connectionSocket);
+                    continue;
+                }
+                int res = iter->enableKeepAlive();
+                if (res < 0) {
+                    printf("[tcp_connection %d] enableKeepAlive failed with %d\n", connectionSocket, res);
+                    clients.erase(iter);
                     continue;
                 }
                 event.events = EPOLLIN;
                 event.data.fd = connectionSocket;
                 if (epoll_ctl(epollFD, EPOLL_CTL_ADD, connectionSocket, &event) < 0) {
                     printf("[server] epoll_ctl failed with %d\n", errno);
-                    close(connectionSocket);
+                    clients.erase(iter);
                     return 0;
                 }
-                auto [iter, success] = clients.emplace(connectionSocket, tunIndex, selfAddr);
-                if (!success) {
-                    printf("[server] emplace failed\n");
-                    close(connectionSocket);
-                    continue;
-                }
-                int res = iter->init();
+                res = iter->sendHandshake();
                 if (res < 0) {
-                    printf("[connection %d] init failed with %d\n", connectionSocket, res);
+                    printf("[tcp_connection %d] sendHandshake failed with %d\n", connectionSocket, res);
                     clients.erase(iter);
                     continue;
                 }
-                printf("[server] Established new connection %d\n", connectionSocket);
-            } else if (curFD == tunFD) {
-                auto bytesRead = read(tunFD, buffer, sizeof(buffer));
+                printf("[server] Established new tcp_connection %d\n", connectionSocket);
+            } else if (curFD == tun.fd) {
+                auto bytesRead = tun.recv(buffer);
                 if (bytesRead < 0) {
-                    printf("[server] read from TUN device failed with %d\n", errno);
+                    printf("[server] recv from TUN device failed with %ld\n", bytesRead);
                     return 0;
                 }
                 for (auto iter = clients.begin(); iter != clients.end();) {
                     auto res = iter->send(buffer, bytesRead);
                     if (res < 0) {
-                        printf("[connection %d] send failed with %d\n", iter->fd.operator int(), res);
+                        printf("[tcp_connection %d] send failed with %d\n", iter->fd.operator int(), res);
                         clients.erase(iter++);
                     } else ++iter;
                 }
             } else {
                 auto iter = clients.find<int>(curFD);
                 if (iter == clients.end()) continue;
-                auto bytesRead = read(curFD, buffer, sizeof(buffer));
+                auto bytesRead = iter->recv(buffer);
                 if (bytesRead < 0) {
-                    printf("[connection %d] read failed with %d\n", curFD, errno);
+                    printf("[tcp_connection %d] read failed with %ld\n", curFD, bytesRead);
                     clients.erase(iter);
                     continue;
                 }
-                auto res = iter->onRecv(buffer, bytesRead, tunFD);
+                auto res = iter->onRecv(buffer, bytesRead, tun.fd);
                 if (res < 0) {
-                    printf("[connection %d] onRecv failed with %d\n", curFD, res);
+                    printf("[tcp_connection %d] onRecv failed with %d\n", curFD, res);
                     clients.erase(iter);
                     continue;
                 }
@@ -354,17 +423,11 @@ int server_loop(const fd_guard& tunFD, unsigned tunIndex, in_addr selfAddr, int 
     }
 }
 
-int client_loop(const fd_guard& tunFD, unsigned tunIndex, in_addr selfAddr, in_addr serverAddr, int port) {
-    fd_guard connectSocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (connectSocket < 0) return -1;
-    sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr = serverAddr;
-    addr.sin_port = htons(port);
-    const int keepAlive = 1;
-    if (setsockopt(connectSocket, SOL_SOCKET, SO_KEEPALIVE, &keepAlive, sizeof(keepAlive)) < 0) return -2;
-    if (connect(connectSocket, reinterpret_cast<const struct sockaddr *>(&addr), sizeof(addr)) < 0) return -3;
+int client_loop(const tun_device& tun, in_addr serverAddr, int port) {
+    tcp_connection conn{ tun };
+    if (conn.init() < 0) return -1;
+    if (conn.enableKeepAlive() < 0) return -2;
+    if (conn.connect(serverAddr, port) < 0) return -3;
 
     printf("[client] Connected to server\n");
 
@@ -373,19 +436,18 @@ int client_loop(const fd_guard& tunFD, unsigned tunIndex, in_addr selfAddr, in_a
     epoll_event event;
     memset(&event, 0, sizeof(event));
     event.events = EPOLLIN;
-    event.data.fd = connectSocket;
-    if (epoll_ctl(epollFD, EPOLL_CTL_ADD, connectSocket, &event) < 0) return -5;
+    event.data.fd = conn;
+    if (epoll_ctl(epollFD, EPOLL_CTL_ADD, conn, &event) < 0) return -5;
     event.events = EPOLLIN;
-    event.data.fd = tunFD;
-    if (epoll_ctl(epollFD, EPOLL_CTL_ADD, tunFD, &event) < 0) return -6;
+    event.data.fd = tun.fd;
+    if (epoll_ctl(epollFD, EPOLL_CTL_ADD, tun.fd, &event) < 0) return -6;
     epoll_event events[4];
 
     printf("[client] Epoll initialized\n");
 
-    connection conn{std::move(connectSocket), tunIndex, selfAddr};
-    int res = conn.init();
+    int res = conn.sendHandshake();
     if (res < 0) {
-        printf("[client] init failed with %d\n", res);
+        printf("[client] sendHandshake failed with %d\n", res);
         return -7;
     }
 
@@ -397,10 +459,10 @@ int client_loop(const fd_guard& tunFD, unsigned tunIndex, in_addr selfAddr, in_a
         }
         for (int i = 0; i < num; ++i) {
             int curFD = events[i].data.fd;
-            if (curFD == tunFD) {
-                auto bytesRead = read(tunFD, buffer, sizeof(buffer));
+            if (curFD == tun.fd) {
+                auto bytesRead = tun.recv(buffer);
                 if (bytesRead < 0) {
-                    printf("[client] read from TUN device failed with %d\n", errno);
+                    printf("[client] recv from TUN device failed with %ld\n", bytesRead);
                     return 0;
                 }
                 res = conn.send(buffer, bytesRead);
@@ -409,12 +471,12 @@ int client_loop(const fd_guard& tunFD, unsigned tunIndex, in_addr selfAddr, in_a
                     return 0;
                 }
             } else if (curFD == conn) {
-                auto bytesRead = read(curFD, buffer, sizeof(buffer));
+                auto bytesRead = conn.recv(buffer);
                 if (bytesRead < 0) {
-                    printf("[client] read failed with %d\n", errno);
+                    printf("[client] recv failed with %ld\n", bytesRead);
                     return 0;
                 }
-                res = conn.onRecv(buffer, bytesRead, tunFD);
+                res = conn.onRecv(buffer, bytesRead, tun.fd);
                 if (res < 0) {
                     printf("[client] onRecv failed with %d\n", res);
                     return 0;
@@ -432,14 +494,13 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    char devName[1025] = "tun%d";
-    fd_guard tunFD = tun_alloc(devName);
-    if (tunFD < 0) {
-        printf("[main] tun_alloc failed with %d", tunFD.operator int());
+    tun_device tun;
+    int res = tun.init();
+    if (res < 0) {
+        printf("[main] tun.sendHandshake failed with %d", res);
         return -1;
     }
-    unsigned tunIndex = if_nametoindex(devName);
-    printf("[main] Created TUN device %s\n", devName);
+    printf("[main] Created TUN device %s\n", tun.devName);
 
     if (strcmp(argv[1], "server") == 0) {
         if (argc != 4) {
@@ -448,14 +509,14 @@ int main(int argc, char* argv[]) {
         }
         in_addr addr;
         inet_aton(argv[3], &addr);
-        int res = assign_address(devName, addr);
+        res = tun.enable(addr);
         if (res < 0) {
-            printf("[main] assign_address failed with %d", res);
+            printf("[main] tun.enable failed with %d", res);
             return -2;
         }
-        printf("[main] Assigned address %s to %s\n", argv[3], devName);
+        printf("[main] Assigned address %s to %s\n", argv[3], tun.devName);
         printf("[main] Starting server loop...\n");
-        res = server_loop(tunFD, tunIndex, addr, atoi(argv[2]));
+        res = server_loop(tun, atoi(argv[2]));
         if (res < 0) printf("[main] Server loop failed with %d\n", res);
     } else if (strcmp(argv[1], "client") == 0) {
         if (argc != 5) {
@@ -465,14 +526,14 @@ int main(int argc, char* argv[]) {
         in_addr addr, serverAddr;
         inet_aton(argv[2], &addr);
         inet_aton(argv[3], &serverAddr);
-        int res = assign_address(devName, addr);
+        res = tun.enable(addr);
         if (res < 0) {
-            printf("[main] assign_address failed with %d", res);
+            printf("[main] tun.enable failed with %d", res);
             return -2;
         }
-        printf("[main] Assigned address %s to %s\n", argv[2], devName);
+        printf("[main] Assigned address %s to %s\n", argv[2], tun.devName);
         printf("[main] Starting client loop...\n");
-        res = client_loop(tunFD, tunIndex, addr, serverAddr, atoi(argv[4]));
+        res = client_loop(tun, serverAddr, atoi(argv[4]));
         if (res < 0) printf("[main] Client loop failed with %d\n", res);
     } else {
         printf("netutil client/server ...\n");
