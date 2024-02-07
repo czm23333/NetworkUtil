@@ -15,6 +15,7 @@
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <unistd.h>
+#include <netinet/ip.h>
 
 constexpr size_t BUF_SIZE = 4ull * 1024ull * 1024ull;
 
@@ -60,7 +61,7 @@ public:
 
         ifreq ifr;
         memset(&ifr, 0, sizeof(ifr));
-        ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+        ifr.ifr_flags = IFF_TUN;
         strncpy(ifr.ifr_name, devName, IFNAMSIZ);
 
         if(ioctl(tmp, TUNSETIFF, &ifr) < 0) return -2;
@@ -131,11 +132,11 @@ class tcp_connection {
 public:
     fd_guard fd;
     const tun_device& tun;
-private:
     mutable connection_state state = connection_state::WAITING_ADDRESS;
+    mutable in_addr addr;
+private:
 
     mutable size_t cnt = 0;
-    mutable in_addr addr;
     mutable unsigned size;
     mutable char data[BUF_SIZE];
 
@@ -196,6 +197,7 @@ public:
             if (res < 0) printf("[tcp_connection %d] setRoute (del) failed with %d\n", operator int(), res);
             else printf("[tcp_connection %d] Route deleted\n", operator int());
         }
+        if (fd >= 0) shutdown(fd, SHUT_RDWR);
     }
 
     operator int() const {
@@ -376,7 +378,7 @@ int server_loop(const tun_device& tun, int port) {
                     clients.erase(iter);
                     continue;
                 }
-                event.events = EPOLLIN;
+                event.events = EPOLLIN | EPOLLRDHUP | EPOLLHUP;
                 event.data.fd = connectionSocket;
                 if (epoll_ctl(epollFD, EPOLL_CTL_ADD, connectionSocket, &event) < 0) {
                     printf("[server] epoll_ctl failed with %d\n", errno);
@@ -396,7 +398,12 @@ int server_loop(const tun_device& tun, int port) {
                     printf("[server] recv from TUN device failed with %ld\n", bytesRead);
                     return 0;
                 }
+                auto* pi = reinterpret_cast<tun_pi*>(buffer);
+                if (ntohs(pi->proto) != ETH_P_IP) continue;
+                auto* ipHeader = reinterpret_cast<ip*>(buffer + sizeof(tun_pi));
+                in_addr dst = ipHeader->ip_dst;
                 for (auto iter = clients.begin(); iter != clients.end();) {
+                    if (iter->state == connection_state::WAITING_ADDRESS || memcmp(&dst, &iter->addr, sizeof(dst)) != 0) continue;
                     auto res = iter->send(buffer, bytesRead);
                     if (res < 0) {
                         printf("[tcp_connection %d] send failed with %d\n", iter->fd.operator int(), res);
@@ -406,6 +413,12 @@ int server_loop(const tun_device& tun, int port) {
             } else {
                 auto iter = clients.find<int>(curFD);
                 if (iter == clients.end()) continue;
+                if ((events[i].events & EPOLLRDHUP) || (events[i].events & EPOLLHUP)) {
+                    printf("[tcp_connection %d] Disconnected\n", curFD);
+                    clients.erase(iter);
+                    continue;
+                }
+
                 auto bytesRead = iter->recv(buffer);
                 if (bytesRead < 0) {
                     printf("[tcp_connection %d] read failed with %ld\n", curFD, bytesRead);
@@ -435,7 +448,7 @@ int client_loop(const tun_device& tun, in_addr serverAddr, int port) {
     if (epollFD < 0) return -4;
     epoll_event event;
     memset(&event, 0, sizeof(event));
-    event.events = EPOLLIN;
+    event.events = EPOLLIN | EPOLLRDHUP | EPOLLHUP;
     event.data.fd = conn;
     if (epoll_ctl(epollFD, EPOLL_CTL_ADD, conn, &event) < 0) return -5;
     event.events = EPOLLIN;
@@ -465,12 +478,19 @@ int client_loop(const tun_device& tun, in_addr serverAddr, int port) {
                     printf("[client] recv from TUN device failed with %ld\n", bytesRead);
                     return 0;
                 }
+                auto* pi = reinterpret_cast<tun_pi*>(buffer);
+                if (ntohs(pi->proto) != ETH_P_IP) continue;
                 res = conn.send(buffer, bytesRead);
                 if (res < 0) {
                     printf("[client] send failed with %d\n", res);
                     return 0;
                 }
             } else if (curFD == conn) {
+                if ((events[i].events & EPOLLRDHUP) || (events[i].events & EPOLLHUP)) {
+                    printf("[client] Disconnected\n");
+                    return 0;
+                }
+
                 auto bytesRead = conn.recv(buffer);
                 if (bytesRead < 0) {
                     printf("[client] recv failed with %ld\n", bytesRead);
@@ -497,7 +517,7 @@ int main(int argc, char* argv[]) {
     tun_device tun;
     int res = tun.init();
     if (res < 0) {
-        printf("[main] tun.sendHandshake failed with %d", res);
+        printf("[main] tun.init failed with %d", res);
         return -1;
     }
     printf("[main] Created TUN device %s\n", tun.devName);
