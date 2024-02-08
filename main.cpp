@@ -17,8 +17,23 @@
 #include <unistd.h>
 #include <netinet/ip.h>
 #include <memory>
+#include <openssl/evp.h>
+#include <vector>
+#include <openssl/err.h>
+#include <filesystem>
+#include <openssl/pem.h>
 
 constexpr size_t BUF_SIZE = 4ull * 1024ull * 1024ull;
+constexpr size_t SIG_BUF_SIZE = 512;
+constexpr size_t KEY_BUF_SIZE = 4ull * 1024ull;
+
+EVP_MD* sha512;
+
+using pkey_t = std::unique_ptr<EVP_PKEY, void(*)(EVP_PKEY*)>;
+pkey_t privateKey(nullptr, EVP_PKEY_free);
+unsigned char myPublicKey[KEY_BUF_SIZE];
+size_t myPublicKeyLen = 0;
+std::vector<pkey_t> trustedPublicKeys;
 
 class fd_guard {
 public:
@@ -126,7 +141,10 @@ public:
 };
 
 enum class connection_state {
-    WAITING_ADDRESS, WAITING_LENGTH, WAITING_CONTENT
+    WAITING_ADDRESS,
+    WAITING_PUBKEY_LENGTH, WAITING_PUBKEY,
+    WAITING_SIG_LENGTH, WAITING_SIG,
+    WAITING_LENGTH, WAITING_CONTENT
 };
 
 class tcp_connection {
@@ -140,6 +158,10 @@ private:
     mutable unsigned size = 0;
     mutable char data[BUF_SIZE];
     mutable unsigned char sendBuf[BUF_SIZE];
+    mutable unsigned sigLen = 0;
+    mutable unsigned char sig[SIG_BUF_SIZE];
+    mutable unsigned char keyBuf[KEY_BUF_SIZE];
+    mutable EVP_PKEY* publicKey = nullptr;
 
     static size_t writeVarUInt(unsigned num, unsigned char* buf) {
         int len = 0;
@@ -198,6 +220,23 @@ private:
 
         return 0;
     }
+
+    static int sign(const char* msg, size_t len, unsigned char* sig, size_t& sigLen) {
+        std::unique_ptr<EVP_MD_CTX, void(*)(EVP_MD_CTX*)> digestContext(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+        if (EVP_DigestSignInit(digestContext.get(), nullptr, sha512, nullptr, privateKey.get()) != 1) return -1;
+        if (EVP_DigestSignUpdate(digestContext.get(), msg, len) != 1) return -2;
+        if (EVP_DigestSignFinal(digestContext.get(), sig, &sigLen) != 1) return -3;
+        return 0;
+    }
+
+    bool verify(const char* msg, size_t len) const {
+        if (publicKey == nullptr) return false;
+        std::unique_ptr<EVP_MD_CTX, void(*)(EVP_MD_CTX*)> digestContext(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+        if (EVP_DigestVerifyInit(digestContext.get(), nullptr, sha512, nullptr, publicKey) != 1) return false;
+        if (EVP_DigestVerifyUpdate(digestContext.get(), msg, len) != 1) return false;
+        if (EVP_DigestVerifyFinal(digestContext.get(), sig, sigLen) != 1) return false;
+        return true;
+    }
 public:
     explicit tcp_connection(const tun_device& tun) : tun(tun) {}
     tcp_connection(int fd, const tun_device& tun) : fd(fd), tun(tun) {}
@@ -211,6 +250,7 @@ public:
             if (res < 0) printf("[tcp_connection %d] setRoute (del) failed with %d\n", operator int(), res);
             else printf("[tcp_connection %d] Route deleted\n", operator int());
         }
+        if (publicKey != nullptr) EVP_PKEY_free(publicKey);
         if (fd >= 0) shutdown(fd, SHUT_RDWR);
     }
 
@@ -242,6 +282,10 @@ public:
     }
 
     int send(const char* buf, size_t len, bool withLen = true) const {
+        if (len == 0) {
+            printf("[tcp_connection %d] Detected sending with 0 length. This shouldn't have happened.\n", operator int());
+            return 0;
+        }
         if (withLen) {
             unsigned char* ptr = sendBuf;
             size_t lenLen = writeVarUInt(len, ptr);
@@ -263,8 +307,43 @@ public:
         return 0;
     }
 
+    int sendWithSign(const char* buf, size_t len) const {
+        unsigned char sigBuf[SIG_BUF_SIZE];
+        size_t sigLen = sizeof(sigBuf);
+        int res = sign(buf, len, sigBuf, sigLen);
+        if (res < 0) {
+            printf("[tcp_connection %d] sign failed with %d\n", operator int(), res);
+            return -1;
+        }
+        res = send(reinterpret_cast<const char*>(sigBuf), sigLen);
+        if (res < 0) {
+            printf("[tcp_connection %d] send failed with %d\n", operator int(), res);
+            return -2;
+        }
+        res = send(buf, len);
+        if (res < 0) {
+            printf("[tcp_connection %d] send failed with %d\n", operator int(), res);
+            return -3;
+        }
+        return 0;
+    }
+
+    int sendPublicKey() const {
+        return send(reinterpret_cast<const char*>(myPublicKey), myPublicKeyLen);
+    }
+
     int sendHandshake() const {
-        return send(reinterpret_cast<const char *>(&tun.address), sizeof(tun.address), false);
+        int res = send(reinterpret_cast<const char*>(&tun.address), sizeof(tun.address), false);
+        if (res < 0) {
+            printf("[tcp_connection %d] send failed with %d\n", operator int(), res);
+            return -1;
+        }
+        res = sendPublicKey();
+        if (res < 0) {
+            printf("[tcp_connection %d] sendPublicKey failed with %d\n", operator int(), res);
+            return -2;
+        }
+        return 0;
     }
 
     template<size_t S>
@@ -294,32 +373,106 @@ public:
                             return -1;
                         }
                         printf("[tcp_connection %d] Route added\n", operator int());
-                        state = connection_state::WAITING_LENGTH;
+                        state = connection_state::WAITING_PUBKEY_LENGTH;
                         cnt = 0;
                         size = 0;
                     }
                     break;
                 }
-                case connection_state::WAITING_LENGTH: {
+                case connection_state::WAITING_LENGTH:
+                case connection_state::WAITING_PUBKEY_LENGTH:
+                case connection_state::WAITING_SIG_LENGTH: {
                     bool flag = false;
+                    unsigned bitCnt = 0;
                     while (len) {
-                        size <<= 7u;
                         unsigned char tmp = *buf;
-                        size |= tmp & 0b1111111u;
+                        size |= (tmp & 0b1111111u) << bitCnt;
                         ++buf;
                         --len;
+                        bitCnt += 7;
                         if (!(tmp & 0b10000000u)) {
                             flag = true;
                             break;
                         }
                     }
                     if (flag) {
-                        if (size > BUF_SIZE) {
-                            printf("[tcp_connection %d] Illegal data size: %u\n", operator int(), size);
-                            return -2;
+                        switch (state) {
+                            case connection_state::WAITING_LENGTH: {
+                                if (size > BUF_SIZE) {
+                                    printf("[tcp_connection %d] Illegal data size: %u\n", operator int(), size);
+                                    return -2;
+                                }
+                                state = connection_state::WAITING_CONTENT;
+                                cnt = 0;
+                                break;
+                            }
+                            case connection_state::WAITING_PUBKEY_LENGTH: {
+                                if (size > KEY_BUF_SIZE) {
+                                    printf("[tcp_connection %d] Illegal public key size: %u\n", operator int(), size);
+                                    return -3;
+                                }
+                                state = connection_state::WAITING_PUBKEY;
+                                cnt = 0;
+                                break;
+                            }
+                            case connection_state::WAITING_SIG_LENGTH: {
+                                if (size > SIG_BUF_SIZE) {
+                                    printf("[tcp_connection %d] Illegal signature size: %u\n", operator int(), size);
+                                    return -4;
+                                }
+                                sigLen = size;
+                                state = connection_state::WAITING_SIG;
+                                cnt = 0;
+                                break;
+                            }
+                            default:
+                                break;
                         }
-                        state = connection_state::WAITING_CONTENT;
+                    }
+                    break;
+                }
+                case connection_state::WAITING_PUBKEY: {
+                    size_t keyLeft = size - cnt;
+                    size_t keyRead = std::min(len, keyLeft);
+                    memcpy(keyBuf + cnt, buf, keyRead);
+                    cnt += keyRead;
+                    buf += keyRead;
+                    len -= keyRead;
+                    if (cnt == size) {
+                        const unsigned char* ptr = keyBuf;
+                        publicKey = d2i_PublicKey(EVP_PKEY_DSA, nullptr, &ptr, size);
+                        if (publicKey == nullptr) {
+                            printf("[tcp_connection %d] d2i_PublicKey failed with %lu\n", operator int(), ERR_get_error());
+                            return -5;
+                        }
+                        bool flag = false;
+                        for (auto& trusted : trustedPublicKeys) {
+                            if (EVP_PKEY_eq(trusted.get(), publicKey) == 1) {
+                                flag = true;
+                                break;
+                            }
+                        }
+                        if (!flag) {
+                            printf("[tcp_connection %d] Untrusted public key\n", operator int());
+                            return -6;
+                        }
+                        state = connection_state::WAITING_SIG_LENGTH;
                         cnt = 0;
+                        size = 0;
+                    }
+                    break;
+                }
+                case connection_state::WAITING_SIG: {
+                    size_t sigLeft = size - cnt;
+                    size_t sigRead = std::min(len, sigLeft);
+                    memcpy(sig + cnt, buf, sigRead);
+                    cnt += sigRead;
+                    buf += sigRead;
+                    len -= sigRead;
+                    if (cnt == size) {
+                        state = connection_state::WAITING_LENGTH;
+                        cnt = 0;
+                        size = 0;
                     }
                     break;
                 }
@@ -331,12 +484,16 @@ public:
                     buf += dataRead;
                     len -= dataRead;
                     if (cnt == size) {
+                        if (!verify(data, size)) {
+                            printf("[tcp_connection %d] Invalidated data\n", operator int());
+                            return -7;
+                        }
                         auto res = tun.send(data, size);
                         if (res < 0) {
                             printf("[tcp_connection %d] write to TUN device failed with %d\n", operator int(), res);
-                            return -3;
+                            return -8;
                         }
-                        state = connection_state::WAITING_LENGTH;
+                        state = connection_state::WAITING_SIG_LENGTH;
                         cnt = 0;
                         size = 0;
                     }
@@ -431,9 +588,9 @@ int server_loop(const tun_device& tun, int port) {
                 in_addr dst = ipHeader->ip_dst;
                 for (auto iter = clients.begin(); iter != clients.end();) {
                     if (iter->state == connection_state::WAITING_ADDRESS || memcmp(&dst, &iter->addr, sizeof(dst)) != 0) continue;
-                    auto res = iter->send(buffer, bytesRead);
+                    auto res = iter->sendWithSign(buffer, bytesRead);
                     if (res < 0) {
-                        printf("[tcp_connection %d] send failed with %d\n", iter->fd.operator int(), res);
+                        printf("[tcp_connection %d] sendWithSign failed with %d\n", iter->fd.operator int(), res);
                         clients.erase(iter++);
                     } else ++iter;
                 }
@@ -508,9 +665,9 @@ int client_loop(const tun_device& tun, in_addr serverAddr, int port) {
                 }
                 auto* pi = reinterpret_cast<tun_pi*>(buffer);
                 if (ntohs(pi->proto) != ETH_P_IP) continue;
-                res = conn.send(buffer, bytesRead);
+                res = conn.sendWithSign(buffer, bytesRead);
                 if (res < 0) {
-                    printf("[client] send failed with %d\n", res);
+                    printf("[client] sendWithSign failed with %d\n", res);
                     return 0;
                 }
             } else if (curFD == conn) {
@@ -535,57 +692,124 @@ int client_loop(const tun_device& tun, in_addr serverAddr, int port) {
 }
 
 int main(int argc, char* argv[]) {
+    OPENSSL_init();
+    OpenSSL_add_all_algorithms();
+    sha512 = EVP_MD_fetch(nullptr, "SHA512", nullptr);
     signal(SIGPIPE, SIG_IGN);
 
-    if (argc < 2) {
-        printf("netutil client/server ...\n");
+    if (argc < 5) {
+        printf("netutil client/server <private key path> <public key path> <trusted public keys dir> ...\n");
         return 0;
+    }
+
+    {
+        BIO *priKeyBIO = BIO_new_file(argv[2], "r");
+        if (priKeyBIO == nullptr) {
+            printf("[main] BIO_new_file on private key file failed\n");
+            return -1;
+        }
+        EVP_PKEY *priKey = PEM_read_bio_PrivateKey(priKeyBIO, nullptr, nullptr, nullptr);
+        if (priKey == nullptr) {
+            printf("[main] PEM_read_bio_PrivateKey failed\n");
+            return -2;
+        }
+        privateKey = {priKey, EVP_PKEY_free};
+        BIO_free(priKeyBIO);
+    }
+
+    {
+        BIO *pubKeyBIO = BIO_new_file(argv[3], "r");
+        if (pubKeyBIO == nullptr) {
+            printf("[main] BIO_new_file on public key file failed\n");
+            return -3;
+        }
+        EVP_PKEY *pubKey = PEM_read_bio_PUBKEY(pubKeyBIO, nullptr, nullptr, nullptr);
+        if (pubKey == nullptr) {
+            printf("[main] PEM_read_bio_PUBKEY failed\n");
+            return -4;
+        }
+        BIO_free(pubKeyBIO);
+
+        unsigned char* myPublicKeyBuf = myPublicKey;
+        int lenTmp = i2d_PublicKey(pubKey, &myPublicKeyBuf);
+        if (lenTmp < 0) {
+            printf("[main] i2d_PublicKey failed with %lu\n", ERR_get_error());
+            return -5;
+        }
+        myPublicKeyLen = lenTmp;
+
+        EVP_PKEY_free(pubKey);
+    }
+
+    {
+        using namespace std::filesystem;
+        path trustedPath(argv[4]);
+        if (!is_directory(trustedPath)) {
+            printf("[main] Invalid trusted public keys directory\n");
+            return -6;
+        }
+        for (auto& entry : directory_iterator(trustedPath)) {
+            BIO *pubKeyBIO = BIO_new_file(entry.path().c_str(), "r");
+            if (pubKeyBIO == nullptr) {
+                printf("[main] BIO_new_file on trusted public key file failed, skipping\n");
+                continue;
+            }
+            EVP_PKEY *pubKey = PEM_read_bio_PUBKEY(pubKeyBIO, nullptr, nullptr, nullptr);
+            BIO_free(pubKeyBIO);
+            if (pubKey == nullptr) {
+                printf("[main] PEM_read_bio_PUBKEY failed, skipping\n");
+                continue;
+            }
+            trustedPublicKeys.emplace_back(pubKey, EVP_PKEY_free);
+        }
     }
 
     tun_device tun;
     int res = tun.init();
     if (res < 0) {
-        printf("[main] tun.init failed with %d", res);
-        return -1;
+        printf("[main] tun.init failed with %d\n", res);
+        return -7;
     }
     printf("[main] Created TUN device %s\n", tun.devName);
 
     if (strcmp(argv[1], "server") == 0) {
-        if (argc != 4) {
-            printf("NetworkUtil server <port> <virtual ip>\n");
+        if (argc != 7) {
+            printf("netutil server <private key path> <public key path> <trusted public keys dir> <port> <virtual ip>\n");
             return 0;
         }
         in_addr addr;
-        inet_aton(argv[3], &addr);
+        inet_aton(argv[6], &addr);
         res = tun.enable(addr);
         if (res < 0) {
-            printf("[main] tun.enable failed with %d", res);
-            return -2;
+            printf("[main] tun.enable failed with %d\n", res);
+            return -8;
         }
-        printf("[main] Assigned address %s to %s\n", argv[3], tun.devName);
+        printf("[main] Assigned address %s to %s\n", argv[6], tun.devName);
         printf("[main] Starting server loop...\n");
-        res = server_loop(tun, atoi(argv[2]));
+        res = server_loop(tun, atoi(argv[5]));
         if (res < 0) printf("[main] Server loop failed with %d\n", res);
     } else if (strcmp(argv[1], "client") == 0) {
-        if (argc != 5) {
-            printf("NetworkUtil client <virtual ip> <server ip> <server port>\n");
+        if (argc != 8) {
+            printf("netutil client <private key path> <public key path> <trusted public keys dir> <virtual ip> <server ip> <server port>\n");
             return 0;
         }
         in_addr addr, serverAddr;
-        inet_aton(argv[2], &addr);
-        inet_aton(argv[3], &serverAddr);
+        inet_aton(argv[5], &addr);
+        inet_aton(argv[6], &serverAddr);
         res = tun.enable(addr);
         if (res < 0) {
-            printf("[main] tun.enable failed with %d", res);
-            return -2;
+            printf("[main] tun.enable failed with %d\n", res);
+            return -9;
         }
-        printf("[main] Assigned address %s to %s\n", argv[2], tun.devName);
+        printf("[main] Assigned address %s to %s\n", argv[5], tun.devName);
         printf("[main] Starting client loop...\n");
-        res = client_loop(tun, serverAddr, atoi(argv[4]));
+        res = client_loop(tun, serverAddr, atoi(argv[7]));
         if (res < 0) printf("[main] Client loop failed with %d\n", res);
     } else {
         printf("netutil client/server ...\n");
         return 0;
     }
+
+    EVP_MD_free(sha512);
     return 0;
 }
