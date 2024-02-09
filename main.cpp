@@ -383,13 +383,12 @@ public:
                 case connection_state::WAITING_PUBKEY_LENGTH:
                 case connection_state::WAITING_SIG_LENGTH: {
                     bool flag = false;
-                    unsigned bitCnt = 0;
                     while (len) {
                         unsigned char tmp = *buf;
-                        size |= (tmp & 0b1111111u) << bitCnt;
+                        size |= (tmp & 0b1111111u) << (cnt * 7u);
                         ++buf;
                         --len;
-                        bitCnt += 7;
+                        ++cnt;
                         if (!(tmp & 0b10000000u)) {
                             flag = true;
                             break;
