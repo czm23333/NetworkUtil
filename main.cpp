@@ -586,7 +586,10 @@ int server_loop(const tun_device& tun, int port) {
                 auto* ipHeader = reinterpret_cast<ip*>(buffer + sizeof(tun_pi));
                 in_addr dst = ipHeader->ip_dst;
                 for (auto iter = clients.begin(); iter != clients.end();) {
-                    if (iter->state == connection_state::WAITING_ADDRESS || memcmp(&dst, &iter->addr, sizeof(dst)) != 0) continue;
+                    if (iter->state == connection_state::WAITING_ADDRESS || memcmp(&dst, &iter->addr, sizeof(dst)) != 0) {
+                        ++iter;
+                        continue;
+                    }
                     auto res = iter->sendWithSign(buffer, bytesRead);
                     if (res < 0) {
                         printf("[tcp_connection %d] sendWithSign failed with %d\n", iter->fd.operator int(), res);
